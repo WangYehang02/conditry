@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Checkpoints and run outputs
+models/
+outputs/
+results/
+*.pt
+
+# IDE
+.idea/
+.vscode/
+
+# Data cache (PyGOD)
+data/

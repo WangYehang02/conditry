@@ -1,0 +1,17 @@
+dataset: weibo
+exp_tag: fmgad_weibo
+ae_alpha: 1.0
+ae_dropout: 0.1
+ae_lr: 0.005
+flow_t_sampling: uniform
+hid_dim: null
+proto_alpha: 0.001
+residual_scale: 20.0
+sample_steps: 1
+use_score_smoothing: true
+use_virtual_neighbors: true
+weight: 0.0
+num_trial: 1
+polarity_consensus_threshold: 0.7
+polarity_consensus_score_weight: 0.9
+polarity_enabled: true
