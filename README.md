@@ -62,16 +62,21 @@ python tests/test_consensus_polarity.py
 ## 文件结构
 
 ```
-main_train.py          # 训练/评估入口
-model.py               # ResFlowGAD 模型
-utils.py               # local_prior + 秩共识校准
-auto_encoder.py        # 图自编码器
-encoder.py             # 双残差特征
-flow_matching_model.py # Flow Matching
-FMloss.py              # FM 损失
-configs/               # 五数据集配置
-scripts/run_single.py  # 单 run wrapper
-tests/                 # 极性单元测试
+main_train.py              # 兼容旧命令的训练/评估入口
+fmgad/
+  cli.py                   # 参数解析、配置读取、运行落盘
+  detector.py              # ResFlowGAD 主训练/评估流程
+  graph_ops.py             # 图平滑、虚拟 kNN 边
+  scoring.py               # local_prior + 秩共识校准
+  residuals.py             # 双残差特征
+  losses.py                # Flow Matching 损失
+  models/
+    autoencoder.py         # 图自编码器
+    flow_matching.py       # Flow Matching 网络与采样
+configs/                   # 五数据集配置
+scripts/run_single.py      # 单 run wrapper
+scripts/run_all_5seeds.py  # 多数据集多 seed wrapper
+tests/                     # 极性单元测试
 ```
 
 ## 依赖

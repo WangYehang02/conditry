@@ -1,15 +1,12 @@
-import os
-import sys
 import math
+import os
 import time
 import tqdm
-import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple
 
 from torch_geometric.transforms import BaseTransform
-from torch_geometric.data import Data
 from torch_geometric.utils import to_dense_adj
 from sklearn.metrics import auc, precision_recall_curve
 from pygod.metric.metric import (
@@ -21,73 +18,17 @@ from pygod.metric.metric import (
 
 from pygod.utils import load_data
 
-FMGAD_ROOT = os.path.dirname(os.path.abspath(__file__))
-if FMGAD_ROOT not in sys.path:
-    sys.path.insert(0, FMGAD_ROOT)
-
-from auto_encoder import GraphAE
-from utils import (
-    softmax_with_temperature,
-    compute_smoothgnn_local_prior,
-    calibrate_polarity_consensus_rank,
+from fmgad.graph_ops import add_virtual_knn_edges, smooth_scores_by_graph
+from fmgad.losses import conditional_flow_matching_loss, flow_matching_loss
+from fmgad.models import (
+    FlowMatchingModel,
+    GraphAE,
+    MLPFlowMatching,
+    sample_flow_matching,
+    sample_flow_matching_free,
 )
-from flow_matching_model import MLPFlowMatching, FlowMatchingModel, sample_flow_matching, sample_flow_matching_free
-from FMloss import flow_matching_loss, conditional_flow_matching_loss
-
-from encoder import compute_dual_residuals_with_degree
-
-
-def _smooth_scores_by_graph(
-    score: torch.Tensor, edge_index: torch.Tensor, alpha: float, device: torch.device
-) -> torch.Tensor:
-    """score_smoothed = (1-alpha)*score + alpha*mean(score[neighbors])."""
-    if alpha <= 0.0 or edge_index.numel() == 0:
-        return score
-    src, dst = edge_index[0], edge_index[1]
-    n = score.size(0)
-    neigh_sum = torch.zeros(n, device=device, dtype=score.dtype)
-    neigh_sum.index_add_(0, dst, score[src])
-    deg = torch.zeros(n, device=device, dtype=score.dtype)
-    deg.index_add_(0, dst, torch.ones_like(score[src]))
-    deg = deg.clamp_min(1.0)
-    neigh_mean = neigh_sum / deg
-    return (1.0 - alpha) * score + alpha * neigh_mean
-
-
-def _add_virtual_knn_edges(
-    edge_index: torch.Tensor,
-    h: torch.Tensor,
-    degree_threshold: int,
-    k: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Append kNN edges in embedding space for low-degree nodes. Skipped when n > 50000 (O(n^2) sim matrix)."""
-    n = h.size(0)
-    if n > 50000:
-        return edge_index
-    with torch.no_grad():
-        deg = torch.zeros(n, device=device, dtype=torch.long)
-        deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), device=device, dtype=torch.long))
-        low_deg_mask = (deg < degree_threshold) & (deg >= 0)
-        if low_deg_mask.sum() == 0:
-            return edge_index
-        h_norm = torch.nn.functional.normalize(h, p=2, dim=1)
-        sim = torch.mm(h_norm, h_norm.t())
-        sim.fill_diagonal_(-1e9)
-        _, idx = sim.topk(min(k, n - 1), dim=1)
-        new_edges = []
-        for i in range(n):
-            if not low_deg_mask[i]:
-                continue
-            for j in idx[i].tolist():
-                if j != i:
-                    new_edges.append([i, j])
-        if not new_edges:
-            return edge_index
-        new_edges = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
-        combined = torch.cat([edge_index, new_edges], dim=1)
-        combined = torch.unique(combined, dim=1)
-        return combined
+from fmgad.residuals import compute_dual_residuals_with_degree
+from fmgad.scoring import calibrate_polarity_consensus_rank, compute_local_prior, softmax_with_temperature
 
 
 class _GateParams(nn.Module):
@@ -211,7 +152,7 @@ class ResFlowGAD(BaseTransform):
         h = self.ae.encode(x, edge_index)
         dev = h.device
         if self.use_virtual_neighbors and getattr(self, "virtual_degree_threshold", 5) is not None:
-            edge_index = _add_virtual_knn_edges(
+            edge_index = add_virtual_knn_edges(
                 edge_index, h,
                 self.virtual_degree_threshold,
                 getattr(self, "virtual_k", 5),
@@ -252,7 +193,7 @@ class ResFlowGAD(BaseTransform):
         if self.polarity_enabled:
             if self.verbose:
                 print("Precomputing local_prior polarity probe...", flush=True)
-            self._local_prior_probe = compute_smoothgnn_local_prior(data.x.cpu(), data.edge_index.cpu())
+            self._local_prior_probe = compute_local_prior(data.x.cpu(), data.edge_index.cpu())
         else:
             self._local_prior_probe = None
         if self.hid_dim is None:
@@ -530,8 +471,6 @@ class ResFlowGAD(BaseTransform):
         return normed * std + mean
 
     def _train_dm_free(self, data, ae_path: str) -> torch.Tensor:
-        from flow_matching_model import sample_flow_matching
-
         dm_path = os.path.join(ae_path, "dm_self.pt")
         if os.environ.get("FMGAD_REUSE_CHECKPOINTS", "0") == "1" and os.path.exists(dm_path):
             state = torch.load(dm_path, map_location="cpu")
@@ -745,7 +684,7 @@ class ResFlowGAD(BaseTransform):
         score = raw_score
 
         if getattr(self, "use_score_smoothing", False) and edge_index.numel() > 0:
-            score = _smooth_scores_by_graph(score, edge_index, self.score_smoothing_alpha, score.device)
+            score = smooth_scores_by_graph(score, edge_index, self.score_smoothing_alpha, score.device)
 
         if not bool(getattr(self, "ensemble_score", False)):
             score = self._apply_score_polarity_adapter(score)

@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-import numpy as np
+
 
 def flow_matching_loss(model, x_1, graph_context, reduction='mean', weight=None):
     """

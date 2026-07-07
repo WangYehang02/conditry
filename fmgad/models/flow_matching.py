@@ -1,15 +1,7 @@
-from typing import Callable, Union
-import math
 import torch
 import torch.nn as nn
-import torch.optim
 
-ModuleType = Union[str, Callable[..., nn.Module]]
-
-
-class SiLU(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(x)
+from fmgad.losses import conditional_flow_matching_loss, flow_matching_loss
 
 
 class FlowMatchingLoss:
@@ -163,7 +155,7 @@ class PositionalEmbedding(torch.nn.Module):
 
 
 class FlowMatchingModel(nn.Module):
-    """Flow-matching training wrapper (uses losses in FMloss.py)."""
+    """Flow-matching training wrapper."""
     def __init__(self, velocity_fn, hid_dim, sigma_min=0.01, sigma_max=1.0):
         super().__init__()
         self.hid_dim = hid_dim
@@ -185,8 +177,6 @@ class FlowMatchingModel(nn.Module):
             score: per-node anomaly score [batch]
             reconstructed: sampled reconstruction [batch, hid_dim]
         """
-        from .FMloss import flow_matching_loss, conditional_flow_matching_loss
-
         # Conditional vs unconditional FM loss
         if proto is not None:
             graph_context = proto

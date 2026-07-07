@@ -6,9 +6,9 @@ __pycache__/
 venv/
 
 # Checkpoints and run outputs
-models/
-outputs/
-results/
+/models/
+/outputs/
+/results/
 *.pt
 
 # IDE

@@ -1,4 +1,4 @@
-"""Helpers for FMGAD (local_prior polarity only)."""
+"""Scoring helpers for FMGAD local-prior polarity calibration."""
 
 from typing import Any, Dict, List, Tuple
 
@@ -62,7 +62,7 @@ def softmax_with_temperature(x: torch.Tensor, t: float = 1.0, dim: int = -1) -> 
     return F.softmax(x / t, dim=dim)
 
 
-def compute_smoothgnn_local_prior(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+def compute_local_prior(x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     """Per-node ||x_i - mean(neighbors(i))||_2 — the sole polarity probe."""
     with torch.no_grad():
         xf = x.float()
@@ -75,3 +75,7 @@ def compute_smoothgnn_local_prior(x: torch.Tensor, edge_index: torch.Tensor) -> 
         deg_u = deg.clamp_min(1.0).unsqueeze(-1)
         neigh_mean = neigh_sum / deg_u
         return torch.norm(xf - neigh_mean, p=2, dim=1)
+
+
+# Backward-compatible name used by the original scripts.
+compute_smoothgnn_local_prior = compute_local_prior
