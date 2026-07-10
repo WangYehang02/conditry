@@ -29,16 +29,28 @@ def add_virtual_knn_edges(
     k: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Append embedding-space kNN edges for low-degree nodes."""
+    """Append embedding-space kNN *incoming* edges for low in-degree nodes.
+
+    Residual / neighbor-mean aggregation uses edges as src -> dst (dst receives
+    from src). For a low-degree node i we therefore add edges (j, i), not (i, j).
+    Each node is supplemented with up to ``min(k, degree_threshold - deg(i))``
+    virtual neighbors drawn from embedding kNN, skipping existing incoming neighbors.
+    """
     n = h.size(0)
     if n > 50000:
         return edge_index
     with torch.no_grad():
+        src, dst = edge_index[0], edge_index[1]
         deg = torch.zeros(n, device=device, dtype=torch.long)
-        deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), device=device, dtype=torch.long))
+        deg.scatter_add_(0, dst, torch.ones(edge_index.size(1), device=device, dtype=torch.long))
         low_deg_mask = deg < degree_threshold
         if low_deg_mask.sum() == 0:
             return edge_index
+
+        # Incoming neighbor sets for deduplication.
+        incoming = [set() for _ in range(n)]
+        for s, d in zip(src.tolist(), dst.tolist()):
+            incoming[d].add(s)
 
         h_norm = torch.nn.functional.normalize(h, p=2, dim=1)
         sim = torch.mm(h_norm, h_norm.t())
@@ -49,9 +61,18 @@ def add_virtual_knn_edges(
         for i in range(n):
             if not low_deg_mask[i]:
                 continue
+            need = min(k, max(0, degree_threshold - int(deg[i].item())))
+            if need <= 0:
+                continue
+            added = 0
             for j in idx[i].tolist():
-                if j != i:
-                    new_edges.append([i, j])
+                if j == i or j in incoming[i]:
+                    continue
+                # j -> i: j becomes an incoming neighbor of i for local aggregation.
+                new_edges.append([j, i])
+                added += 1
+                if added >= need:
+                    break
         if not new_edges:
             return edge_index
 
