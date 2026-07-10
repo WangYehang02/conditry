@@ -9,6 +9,7 @@ proto_alpha: 0.001
 residual_scale: 20.0
 sample_steps: 1
 use_score_smoothing: true
+score_smoothing_alpha: 0.45
 use_virtual_neighbors: true
 weight: 0.0
 num_trial: 1
