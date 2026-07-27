@@ -21,9 +21,12 @@ from pygod.utils import load_data
 from fmgad.graph_ops import add_virtual_knn_edges, smooth_scores_by_graph
 from fmgad.losses import conditional_flow_matching_loss, flow_matching_loss
 from fmgad.models import (
+    DiffusionModel,
     FlowMatchingModel,
     GraphAE,
+    MLPDiffusion,
     MLPFlowMatching,
+    sample_dm,
     sample_flow_matching,
     sample_flow_matching_free,
 )
@@ -71,15 +74,14 @@ class ResFlowGAD(BaseTransform):
         use_virtual_neighbors: bool = True,
         virtual_degree_threshold: int = 5,
         virtual_k: int = 5,
-        use_score_smoothing: bool = True,
         score_smoothing_alpha: float = 0.3,
-        flow_t_sampling: str = "logit_normal",
         ensemble_score: bool = True,
         num_trial: int = 3,
         exp_tag: Optional[str] = None,
         polarity_enabled: bool = True,
         polarity_consensus_threshold: float = 0.70,
         polarity_consensus_score_weight: float = 0.90,
+        generative_backend: str = "flow",
     ):
         self.name = name
         self.num_trial = num_trial
@@ -92,7 +94,12 @@ class ResFlowGAD(BaseTransform):
         self.weight = weight
         self.sample_steps = sample_steps
         self.verbose = verbose
-        self.use_proto = bool(use_proto)
+        backend = str(generative_backend or "flow").strip().lower()
+        if backend not in ("flow", "diffusion"):
+            raise ValueError(f"Unsupported generative_backend={generative_backend!r}")
+        self.generative_backend = backend
+        # Diffusion ablation: free-only EDM; never use prototype guidance.
+        self.use_proto = bool(use_proto) and backend == "flow"
         self.profile_efficiency = bool(profile_efficiency)
         self.proto_alpha = proto_alpha
         self.residual_scale = residual_scale
@@ -100,9 +107,8 @@ class ResFlowGAD(BaseTransform):
         self.use_virtual_neighbors = use_virtual_neighbors
         self.virtual_degree_threshold = virtual_degree_threshold
         self.virtual_k = virtual_k
-        self.use_score_smoothing = use_score_smoothing
-        self.score_smoothing_alpha = score_smoothing_alpha
-        self.flow_t_sampling = flow_t_sampling
+        # Score smoothing is always on; alpha=0 makes it a no-op (for ablations).
+        self.score_smoothing_alpha = float(score_smoothing_alpha)
         self.ensemble_score = ensemble_score
         self.exp_tag = exp_tag
         self.polarity_enabled = bool(polarity_enabled)
@@ -235,9 +241,13 @@ class ResFlowGAD(BaseTransform):
             # z_dim = 2*hid_dim
             z_dim = 2 * self.hid_dim
 
-            # Free-flow model: cond_dim=None => zero context vector.
-            velocity_free = MLPFlowMatching(d_in=z_dim, dim_t=512, cond_dim=None).cuda()
-            self.dm = FlowMatchingModel(velocity_fn=velocity_free, hid_dim=z_dim).cuda()
+            if self.generative_backend == "diffusion":
+                denoise_free = MLPDiffusion(d_in=z_dim, dim_t=512).cuda()
+                self.dm = DiffusionModel(denoise_fn=denoise_free, hid_dim=z_dim).cuda()
+            else:
+                # Free-flow model: cond_dim=None => zero context vector.
+                velocity_free = MLPFlowMatching(d_in=z_dim, dim_t=512, cond_dim=None).cuda()
+                self.dm = FlowMatchingModel(velocity_fn=velocity_free, hid_dim=z_dim).cuda()
             if bool(getattr(self, "profile_efficiency", False)):
                 _sync_cuda()
                 _t_train = time.perf_counter()
@@ -250,7 +260,7 @@ class ResFlowGAD(BaseTransform):
             self.dm.load_state_dict(dm_dict["state_dict"])
             if "gate_state" in dm_dict:
                 self.gate_module.load_state_dict(dm_dict["gate_state"])
-            self.proto = dm_dict["prototype"]  # [hid_dim]
+            self.proto = dm_dict.get("prototype")
 
             if bool(getattr(self, "use_proto", True)):
                 # Proto model: cond_dim = hid_dim (condition on prototype in h-space).
@@ -320,6 +330,8 @@ class ResFlowGAD(BaseTransform):
             dm_rec = torch.tensor([float(pyg_rec)])
             dm_auprc = torch.tensor([float(pyg_auprc)])
             dm_f1 = torch.tensor([float(pyg_f1)])
+            # Keep for optional unsupervised model selection (e.g. AutoGAD CST).
+            self._last_scores = mean_scores.detach().cpu()
             del self._ensemble_scores
         else:
             dm_auc = torch.tensor(dm_auc)
@@ -379,7 +391,11 @@ class ResFlowGAD(BaseTransform):
             "f1_std": float(torch.std(dm_f1)),
             "polarity_enabled": self.polarity_enabled,
             "polarity_diagnostics": self._last_polarity_diag,
+            "generative_backend": self.generative_backend,
+            "use_proto": bool(self.use_proto),
         }
+        if os.environ.get("FMGAD_SAVE_SCORES", "0") == "1" and getattr(self, "_last_scores", None) is not None:
+            out["scores"] = [float(x) for x in self._last_scores.reshape(-1).tolist()]
         if bool(getattr(self, "profile_efficiency", False)):
             out.update(
                 {
@@ -475,8 +491,11 @@ class ResFlowGAD(BaseTransform):
         if os.environ.get("FMGAD_REUSE_CHECKPOINTS", "0") == "1" and os.path.exists(dm_path):
             state = torch.load(dm_path, map_location="cpu")
             if self.verbose:
-                print("Reusing FM free checkpoint")
+                print(f"Reusing {self.generative_backend} free checkpoint")
             return state.get("prototype")
+
+        if self.generative_backend == "diffusion":
+            return self._train_diffusion_free(data, ae_path)
 
         if self.verbose:
             print("Training FM free model...")
@@ -562,6 +581,91 @@ class ResFlowGAD(BaseTransform):
 
         return proto_h
 
+    def _train_diffusion_free(self, data, ae_path: str) -> Optional[torch.Tensor]:
+        """Train free-only EDM on residual-augmented z (no prototype guidance)."""
+        dm_path = os.path.join(ae_path, "dm_self.pt")
+        if self.verbose:
+            print("Training Diffusion free model (EDM, residual-z)...")
+
+        dm_lr = self.lr * 0.5
+        params = list(self.dm.parameters()) + list(self.gate_module.parameters())
+        optimizer = torch.optim.Adam(params, lr=dm_lr, weight_decay=self.wd)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+
+        best_loss = float("inf")
+        patience = 0
+        proto_h = None
+        with torch.no_grad():
+            x0 = data.x.cuda().to(torch.float32)
+            e0 = data.edge_index.cuda()
+            _, h0, _ = self._build_z(x0, e0)
+            proto_h_init = torch.mean(h0, dim=0).detach()
+
+        for epoch in range(self.diff_epochs):
+            x = data.x.cuda().to(torch.float32)
+            edge_index = data.edge_index.cuda()
+            z, h, _ = self._build_z(x, edge_index)
+            z = self._normalize_clip(z)
+            if torch.isnan(z).any() or torch.isinf(z).any():
+                continue
+
+            loss, _, reconstructed = self.dm(z)
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            if epoch == 0:
+                proto_h = torch.mean(h, dim=0)
+            else:
+                recon_h = reconstructed[:, : self.hid_dim].detach()
+                if torch.isnan(recon_h).any() or torch.isinf(recon_h).any():
+                    recon_h = h.detach()
+                proto_expanded = proto_h.unsqueeze(0)
+                s_v = self.cos(proto_expanded, recon_h)
+                weight = softmax_with_temperature(s_v, t=5).reshape(1, -1)
+                proto_h = torch.mm(weight, recon_h).squeeze(0).detach()
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 0.5)
+            optimizer.step()
+            scheduler.step()
+
+            if self.verbose and epoch % 20 == 0:
+                print(f"Diff-free Epoch {epoch:04d} loss={float(loss):.6f}")
+
+            if float(loss) < best_loss:
+                best_loss = float(loss)
+                patience = 0
+                torch.save(
+                    {
+                        "state_dict": self.dm.state_dict(),
+                        "prototype": proto_h,
+                        "gate_state": self.gate_module.state_dict(),
+                        "generative_backend": "diffusion",
+                    },
+                    dm_path,
+                )
+            else:
+                patience += 1
+                if patience >= self.patience:
+                    if self.verbose:
+                        print("Diff-free early stopping")
+                    break
+
+        if not os.path.exists(dm_path):
+            torch.save(
+                {
+                    "state_dict": self.dm.state_dict(),
+                    "prototype": proto_h if proto_h is not None else proto_h_init,
+                    "gate_state": self.gate_module.state_dict(),
+                    "generative_backend": "diffusion",
+                },
+                dm_path,
+            )
+            if self.verbose:
+                print("Diff-free: fallback save")
+        return proto_h
+
     def _train_dm_proto(self, data, ae_path: str):
         proto_path = os.path.join(ae_path, "proto_dm_self.pt")
         if os.environ.get("FMGAD_REUSE_CHECKPOINTS", "0") == "1" and os.path.exists(proto_path):
@@ -592,7 +696,7 @@ class ResFlowGAD(BaseTransform):
                 self.dm_proto.velocity_fn,
                 z,
                 proto_context,
-                t_sampling=self.flow_t_sampling,
+                t_sampling="logit_normal",
                 reduction="mean",
             )
 
@@ -630,9 +734,6 @@ class ResFlowGAD(BaseTransform):
             proto_model.eval()
         free_model.eval()
 
-        proto_net = proto_model.velocity_fn if proto_model is not None else None
-        free_net = free_model.velocity_fn
-
         x = data.x.cuda().to(torch.float32)
         edge_index = data.edge_index.cuda()
 
@@ -646,35 +747,42 @@ class ResFlowGAD(BaseTransform):
         noise_gen.manual_seed(inference_seed)
         noise = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype, generator=noise_gen)
 
-        proto_context = None
-        if bool(getattr(self, "use_proto", True)) and self.proto is not None:
-            proto_context = self.proto.unsqueeze(0) if self.proto.dim() == 1 else self.proto.mean(dim=0, keepdim=True)
-            if proto_context.dim() == 1:
-                proto_context = proto_context.unsqueeze(0)
-
         s = to_dense_adj(edge_index)[0].cuda()
 
-        # Fix step to 1 and avoid label-based step selection.
-        num_steps = 1
-        if bool(getattr(self, "use_proto", True)) and proto_net is not None and proto_context is not None:
-            reconstructed = sample_flow_matching_free(
-                proto_net,
-                free_net,
-                noise,
-                num_steps,
-                proto=proto_context,
-                proto_alpha=self.proto_alpha,
-                weight=self.weight,
-            )
+        if self.generative_backend == "diffusion":
+            # Free-only EDM sampling from noise; AE reconstruction error for scoring.
+            num_steps = max(int(self.sample_steps), 1)
+            reconstructed = sample_dm(free_model.denoise_fn_D, noise, num_steps=num_steps)
         else:
-            # Hard no-proto: free-only velocity branch for inference.
-            reconstructed = sample_flow_matching(
-                free_net,
-                noise,
-                num_steps=num_steps,
-                proto=None,
-                proto_alpha=None,
-            )
+            proto_net = proto_model.velocity_fn if proto_model is not None else None
+            free_net = free_model.velocity_fn
+            proto_context = None
+            if bool(getattr(self, "use_proto", True)) and self.proto is not None:
+                proto_context = self.proto.unsqueeze(0) if self.proto.dim() == 1 else self.proto.mean(dim=0, keepdim=True)
+                if proto_context.dim() == 1:
+                    proto_context = proto_context.unsqueeze(0)
+
+            # Fix step to 1 and avoid label-based step selection for FM.
+            num_steps = 1
+            if bool(getattr(self, "use_proto", True)) and proto_net is not None and proto_context is not None:
+                reconstructed = sample_flow_matching_free(
+                    proto_net,
+                    free_net,
+                    noise,
+                    num_steps,
+                    proto=proto_context,
+                    proto_alpha=self.proto_alpha,
+                    weight=self.weight,
+                )
+            else:
+                # Hard no-proto: free-only velocity branch for inference.
+                reconstructed = sample_flow_matching(
+                    free_net,
+                    noise,
+                    num_steps=num_steps,
+                    proto=None,
+                    proto_alpha=None,
+                )
 
         h_hat = reconstructed[:, : self.hid_dim]
         x_, s_ = self.ae.decode(h_hat, edge_index)
@@ -683,7 +791,8 @@ class ResFlowGAD(BaseTransform):
         raw_score = score_recon
         score = raw_score
 
-        if getattr(self, "use_score_smoothing", False) and edge_index.numel() > 0:
+        # Graph score smoothing is permanently enabled.
+        if edge_index.numel() > 0:
             score = smooth_scores_by_graph(score, edge_index, self.score_smoothing_alpha, score.device)
 
         if not bool(getattr(self, "ensemble_score", False)):

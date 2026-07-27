@@ -3,7 +3,6 @@ ae_dropout: 0.3
 ae_lr: 0.003
 dataset: reddit
 exp_tag: fmgad_reddit
-flow_t_sampling: uniform
 hid_dim: null
 num_trial: 1
 polarity_consensus_score_weight: 0.7
@@ -12,7 +11,6 @@ polarity_enabled: true
 proto_alpha: 0.005
 residual_scale: 10.0
 sample_steps: 1
-score_smoothing_alpha: 0.45
-use_score_smoothing: true
+score_smoothing_alpha: 0.0
 use_virtual_neighbors: true
 weight: 0.0

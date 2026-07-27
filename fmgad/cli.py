@@ -101,20 +101,21 @@ def main():
         proto_alpha=cfg.get("proto_alpha", 0.01),
         weight=cfg.get("weight", 1.0),
         residual_scale=float(cfg.get("residual_scale", 10.0)),
+        gate_bias=float(cfg.get("gate_bias", 2.0)),
+        gate_sharpness=float(cfg.get("gate_sharpness", 1.0)),
         sample_steps=int(cfg.get("sample_steps", 1)),
         verbose=True,
         use_virtual_neighbors=cfg.get("use_virtual_neighbors", True),
         virtual_degree_threshold=int(cfg.get("virtual_degree_threshold", 5)),
         virtual_k=int(cfg.get("virtual_k", 5)),
-        use_score_smoothing=cfg.get("use_score_smoothing", True),
         score_smoothing_alpha=float(cfg.get("score_smoothing_alpha", 0.3)),
-        flow_t_sampling=cfg.get("flow_t_sampling", "logit_normal"),
         ensemble_score=cfg.get("ensemble_score", True),
         num_trial=args.num_trial if args.num_trial is not None else int(cfg.get("num_trial", 1)),
         exp_tag=cfg.get("exp_tag", None),
         polarity_enabled=bool(cfg.get("polarity_enabled", True)),
         polarity_consensus_threshold=float(cfg.get("polarity_consensus_threshold", 0.70)),
         polarity_consensus_score_weight=float(cfg.get("polarity_consensus_score_weight", 0.90)),
+        generative_backend=str(cfg.get("generative_backend", "flow")),
     )
 
     print("Running on dataset:", dset, "num_trial:", model.num_trial, flush=True)

@@ -3,13 +3,11 @@ exp_tag: fmgad_books
 ae_alpha: 0.75
 ae_dropout: 0.25
 ae_lr: 0.015
-flow_t_sampling: logit_normal
 hid_dim: null
 proto_alpha: 0.001
 residual_scale: 15.0
 sample_steps: 1
-use_score_smoothing: true
-score_smoothing_alpha: 0.5
+score_smoothing_alpha: 0.0
 use_virtual_neighbors: false
 weight: 1.25
 num_trial: 1

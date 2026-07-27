@@ -3,13 +3,11 @@ exp_tag: fmgad_weibo
 ae_alpha: 1.0
 ae_dropout: 0.1
 ae_lr: 0.005
-flow_t_sampling: uniform
 hid_dim: null
 proto_alpha: 0.001
 residual_scale: 20.0
 sample_steps: 1
-use_score_smoothing: true
-score_smoothing_alpha: 0.45
+score_smoothing_alpha: 0.5
 use_virtual_neighbors: true
 weight: 0.0
 num_trial: 1
