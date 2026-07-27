@@ -16,7 +16,7 @@
 | `ae_dropout` | 图自编码器 dropout | App. B.2 / **Table 7** | 0.1 | 0.3 | 0.2 | 0.25 | 0.3 |
 | `flow_t_sampling` | ~~可配~~ → **代码固定** `logit_normal` | Sec. 3.2 | — | — | — | — | — |
 | `use_score_smoothing` | ~~可配~~ → **代码固定开启** | Sec. 3.3 | — | — | — | — | — |
-| `score_smoothing_alpha` | 邻居平滑系数 \(\mu\)（\(s=(1-\mu)s^{\mathrm{raw}}+\mu\,\mathrm{mean}(s^{\mathrm{raw}})\)） | Sec. 3.3 中 \(\mu\) | **0.5** | **0.0** | **0.45** | **0.0** | 0.35 |
+| `score_smoothing_alpha` | 邻居平滑系数 \(\mu\)（\(s=(1-\mu)s^{\mathrm{raw}}+\mu\,\mathrm{mean}(s^{\mathrm{raw}})\)） | Sec. 3.3 中 \(\mu\) | **0.5** | **0.5** | **0.45** | **0.5** | 0.35 |
 | `use_virtual_neighbors` | 是否启用 DB-LVN 虚拟邻居 | Sec. 3.1 **DB-LVN**；Table 3 消融 *w/o Virtual Neighbor* | true | true | true | **false** | true |
 | `virtual_degree_threshold` | DB-LVN 度阈值 \(b\)（低于 \(b\) 的节点补虚拟邻居） | Sec. 3.1 阈值 \(b\)；App. B.2 门控 \(\gamma_i=\sigma((d_i-b)\kappa)\) | — (默认 5) | — (默认 5) | — (默认 5) | —（已关 virt） | **4** |
 | `virtual_k` | 低度节点补充的 top-\(k\) 潜空间近邻数 | Sec. 3.1 DB-LVN「top-\(k\) latent nearest neighbors」 | — (默认 5) | — (默认 5) | — (默认 5) | —（已关 virt） | **6** |
@@ -30,8 +30,8 @@
 
 | 数据集 | 当前 yaml 相对 Table 7 / 旧最佳的主要变化 |
 |--------|----------------------------------|
-| **books** | CST：`score_smoothing_alpha`→**0.0**（关平滑）；`use_virtual_neighbors`→**false**；`polarity_consensus_score_weight`→**0.95** |
-| **reddit** | CST：`score_smoothing_alpha`→**0.0**；`polarity_consensus_score_weight`→**0.7** |
+| **books** | `score_smoothing_alpha`→**0.5**；`use_virtual_neighbors`→**false**；`polarity_consensus_score_weight`→**0.95** |
+| **reddit** | `score_smoothing_alpha`→**0.5**；`polarity_consensus_score_weight`→**0.7** |
 | **enron** | CST：`score_smoothing_alpha`→**0.45**；`residual_scale=15.0`（Table 7 为 20.0） |
 | **disney** | CST：`weight` 2.5→**1.25**；显式 `virtual_degree_threshold=4`, `virtual_k=6` |
 | **weibo** | CST：`score_smoothing_alpha`→**0.5** |

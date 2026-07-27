@@ -11,6 +11,6 @@ polarity_enabled: true
 proto_alpha: 0.005
 residual_scale: 10.0
 sample_steps: 1
-score_smoothing_alpha: 0.0
+score_smoothing_alpha: 0.5
 use_virtual_neighbors: true
 weight: 0.0
