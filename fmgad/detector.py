@@ -115,6 +115,8 @@ class ResFlowGAD(BaseTransform):
             "single_full",
             "single_ref",
             "duplicate_dual",
+            "dual_uniform",
+            "dual_schedule",
             "residual_contrastive",
             "wider_single",
             "shared_two_heads",
@@ -467,6 +469,7 @@ class ResFlowGAD(BaseTransform):
         also_train_gate: bool = True,
         z_cached: Optional[torch.Tensor] = None,
         z_ref_cached: Optional[torch.Tensor] = None,
+        t_sampling: str = "uniform",
     ):
         """Train an unconditional FM on full or residual-suppressed latents."""
         ckpt = os.path.join(ae_path, ckpt_name)
@@ -474,8 +477,11 @@ class ResFlowGAD(BaseTransform):
             if self.verbose:
                 print(f"Reusing FM checkpoint {ckpt_name}")
             return
+        t_sampling = str(t_sampling or "uniform").strip().lower()
+        if t_sampling not in ("uniform", "logit_normal"):
+            raise ValueError(f"Unsupported t_sampling={t_sampling!r}")
         if self.verbose:
-            print(f"Training FM ({latent_kind}) -> {ckpt_name} ...")
+            print(f"Training FM ({latent_kind}, t={t_sampling}) -> {ckpt_name} ...")
 
         fm_lr = self.lr * 0.5
         params = list(model.parameters())
@@ -503,7 +509,14 @@ class ResFlowGAD(BaseTransform):
             if torch.isnan(z).any() or torch.isinf(z).any():
                 continue
             graph_context = torch.zeros(1, z.shape[1], device=z.device)
-            loss = flow_matching_loss(model.velocity_fn, z, graph_context, reduction="mean")
+            # Always go through conditional_flow_matching_loss so t_sampling is explicit.
+            loss = conditional_flow_matching_loss(
+                model.velocity_fn,
+                z,
+                graph_context,
+                t_sampling=t_sampling,
+                reduction="mean",
+            )
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
             optimizer.zero_grad()
@@ -512,7 +525,7 @@ class ResFlowGAD(BaseTransform):
             optimizer.step()
             scheduler.step()
             if self.verbose and epoch % 20 == 0:
-                print(f"FM-{latent_kind} Epoch {epoch:04d} loss={loss.item():.6f}")
+                print(f"FM-{latent_kind}/{t_sampling} Epoch {epoch:04d} loss={loss.item():.6f}")
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 patience = 0
@@ -524,7 +537,7 @@ class ResFlowGAD(BaseTransform):
                 patience += 1
                 if patience >= self.patience:
                     if self.verbose:
-                        print(f"FM-{latent_kind} early stopping")
+                        print(f"FM-{latent_kind}/{t_sampling} early stopping")
                     break
         if not os.path.exists(ckpt):
             torch.save(
@@ -676,19 +689,44 @@ class ResFlowGAD(BaseTransform):
                 self._last_dom_weight_stats = st
             return self.sample_dual(data, shared=False)
 
-        # Dual modes: full + reference nets
+        # Dual schedule ablation: both on full latent; aux may use logit-normal t
+        # without prototype context (isolates schedule from proto conditioning).
+        if mode in ("duplicate_dual", "dual_uniform", "dual_schedule"):
+            self._train_uncond_fm(
+                data, ae_path, self.dm, "dm_full.pt", latent_kind="full", t_sampling="uniform"
+            )
+            state = torch.load(os.path.join(ae_path, "dm_full.pt"))
+            self.dm.load_state_dict(state["state_dict"])
+            if "gate_state" in state:
+                self.gate_module.load_state_dict(state["gate_state"])
+            aux_t = "logit_normal" if mode == "dual_schedule" else "uniform"
+            velocity_ref = MLPFlowMatching(d_in=z_dim, dim_t=hid, cond_dim=None).cuda()
+            self.dm_ref = FlowMatchingModel(velocity_fn=velocity_ref, hid_dim=z_dim).cuda()
+            self._train_uncond_fm(
+                data,
+                ae_path,
+                self.dm_ref,
+                "dm_full_b.pt",
+                latent_kind="full",
+                also_train_gate=False,
+                t_sampling=aux_t,
+            )
+            state_ref = torch.load(os.path.join(ae_path, "dm_full_b.pt"))
+            self.dm_ref.load_state_dict(state_ref["state_dict"])
+            return self.sample_dual(data, shared=False)
+
+        # Dual modes: full + residual-suppressed reference
         self._train_uncond_fm(data, ae_path, self.dm, "dm_full.pt", latent_kind="full")
         state = torch.load(os.path.join(ae_path, "dm_full.pt"))
         self.dm.load_state_dict(state["state_dict"])
         if "gate_state" in state:
             self.gate_module.load_state_dict(state["gate_state"])
 
-        ref_kind = "full" if mode == "duplicate_dual" else "ref"
         velocity_ref = MLPFlowMatching(d_in=z_dim, dim_t=hid, cond_dim=None).cuda()
         self.dm_ref = FlowMatchingModel(velocity_fn=velocity_ref, hid_dim=z_dim).cuda()
-        ref_ckpt = "dm_full_b.pt" if mode == "duplicate_dual" else "dm_ref.pt"
+        ref_ckpt = "dm_ref.pt"
         self._train_uncond_fm(
-            data, ae_path, self.dm_ref, ref_ckpt, latent_kind=ref_kind, also_train_gate=False
+            data, ae_path, self.dm_ref, ref_ckpt, latent_kind="ref", also_train_gate=False
         )
         state_ref = torch.load(os.path.join(ae_path, ref_ckpt))
         self.dm_ref.load_state_dict(state_ref["state_dict"])
