@@ -91,6 +91,8 @@ class ResFlowGAD(BaseTransform):
         dom_weight_mode: str = "learned",
         dom_kappa_q: float = 0.5,
         dom_tau_q: float = 0.2,
+        dom_control_seed: int = 2027,
+        allow_center_fallback: bool = False,
     ):
         self.name = name
         self.num_trial = num_trial
@@ -128,9 +130,12 @@ class ResFlowGAD(BaseTransform):
         self.dom_weight_mode = wmode
         self.dom_kappa_q = float(dom_kappa_q)
         self.dom_tau_q = float(dom_tau_q)
+        self.dom_control_seed = int(dom_control_seed)
+        self.allow_center_fallback = bool(allow_center_fallback)
         self._last_n_eff = float("nan")
         self._last_n_eff_ratio = float("nan")
         self._last_dom_weight_stats = None
+        self._cached_center_latents = None
         # Diffusion ablation: free-only EDM; never use prototype guidance.
         # Dual-flow controls replace free/proto pairing.
         self.use_proto = bool(use_proto) and backend == "flow" and mode is None
@@ -223,52 +228,36 @@ class ResFlowGAD(BaseTransform):
         self,
         h: torch.Tensor,
         mode: Optional[str] = None,
-        feats: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
     ):
-        """Center-consistent sample weights for dominant-mode flow.
+        """Strict center-consistent weights: s_i = cos(h_i, c) only (no residual fallback).
 
-        s_i = cos(feat_i, c), R(s)_i = rank percentile in [0,1],
-        q_i = sg[σ((R(s)_i - κ_q) / τ_q)], π_i = q_i / Σ q_j.
-        Feature priority: h → residual → feats(z). AE h often collapses.
+        q_i = sg[σ((R(s)_i - κ_q) / τ_q)], π_i = q_i / Σ_j q_j.
         Modes: uniform | learned | shuffled | reversed.
+        shuffled uses an independent Generator (does not touch global RNG).
         """
         mode = (mode or self.dom_weight_mode).strip().lower()
         n = int(h.shape[0])
         device = h.device
         dtype = h.dtype
-        feat_used = "h"
+        center_valid = True
+        feat_used = "h_center"
+        s = None
+
         if mode == "uniform":
             q = torch.ones(n, device=device, dtype=dtype)
+            feat_used = "uniform"
         else:
-            use = h
-            feat_used = "h"
-            if float(h.std()) < 1e-5:
-                if residual is not None and float(residual.std()) >= 1e-5:
-                    use = residual
-                    feat_used = "residual"
-                elif feats is not None and float(feats.std()) >= 1e-5:
-                    use = feats
-                    feat_used = "z"
-            c = use.mean(dim=0, keepdim=True).detach()
+            use = h.detach()
+            c = use.mean(dim=0, keepdim=True)
             s = torch.nn.functional.cosine_similarity(use, c.expand(n, -1), dim=1)
-            # If cosine still flat (all parallel), fall back to residual energy.
-            if float(s.std()) < 1e-8:
-                if residual is not None:
-                    s = -torch.norm(residual.detach(), dim=1)  # smaller residual → more normal
-                    feat_used = "neg_residual_norm"
-                elif feats is not None:
-                    # residual half of z if available
-                    hid = int(getattr(self, "hid_dim", use.shape[1] // 2) or use.shape[1] // 2)
-                    if feats.shape[1] > hid:
-                        s = -torch.norm(feats[:, hid:].detach(), dim=1)
-                        feat_used = "neg_z_residual_norm"
-                    else:
-                        s = -torch.norm(feats.detach(), dim=1)
-                        feat_used = "neg_feat_norm"
-            if float(s.std()) < 1e-8:
+            s_std = float(s.std())
+            if s_std < 1e-4:
+                # Center similarity has no discrimination — mark invalid, do NOT
+                # silently switch to residual weighting.
                 q = torch.ones(n, device=device, dtype=dtype)
-                feat_used = "collapsed_uniform"
+                feat_used = "center_collapsed_uniform"
+                center_valid = False
             else:
                 order = torch.argsort(s)
                 ranks = torch.empty(n, device=device, dtype=dtype)
@@ -276,15 +265,23 @@ class ResFlowGAD(BaseTransform):
                 kappa = float(self.dom_kappa_q)
                 tau = max(float(self.dom_tau_q), 1e-6)
                 q = torch.sigmoid((ranks - kappa) / tau).detach()
+                feat_used = "h_center"
+
             if mode == "shuffled":
-                q = q[torch.randperm(n, device=device)]
+                # Independent CPU generator: does not consume the global RNG stream.
+                gen = torch.Generator()
+                gen.manual_seed(int(self.dom_control_seed))
+                perm = torch.randperm(n, generator=gen).to(device)
+                q = q[perm]
             elif mode == "reversed":
                 q = (1.0 - q).clamp_min(1e-8)
             elif mode != "learned":
                 raise ValueError(f"Unsupported dom_weight_mode={mode!r}")
+
         q = q.clamp_min(1e-8)
         n_eff = float((q.sum() ** 2) / q.pow(2).sum().clamp_min(1e-12))
         pi = q / q.sum().clamp_min(1e-8)
+
         stats = {
             "mode": mode,
             "n": n,
@@ -296,8 +293,61 @@ class ResFlowGAD(BaseTransform):
             "kappa_q": float(self.dom_kappa_q),
             "tau_q": float(self.dom_tau_q),
             "feat_used": feat_used,
+            "center_valid": bool(center_valid),
+            "dom_control_seed": int(self.dom_control_seed),
         }
+        if s is not None:
+            s_np = s.detach().float().cpu()
+            stats["s_std"] = float(s_np.std())
+            stats["s_p05"] = float(torch.quantile(s_np, 0.05))
+            stats["s_p95"] = float(torch.quantile(s_np, 0.95))
+            stats["s_p95_p05"] = float(stats["s_p95"] - stats["s_p05"])
+            # Top vs bottom weight pool: mean center similarity gap (analysis only).
+            k = max(1, n // 20)
+            top_idx = torch.topk(q, k).indices
+            bot_idx = torch.topk(-q, k).indices
+            stats["s_top_minus_bottom"] = float(s[top_idx].mean() - s[bot_idx].mean())
+        if y is not None and s is not None and center_valid:
+            # Post-hoc only: never used for HP selection.
+            try:
+                from pygod.utils import eval_roc_auc
+
+                y_bool = y.bool().cpu() if hasattr(y, "bool") else torch.as_tensor(y).bool()
+                # Higher q ≈ more "normal/dominant"; invert for anomaly AUROC of weight.
+                stats["q_vs_label_auroc_analysis"] = float(
+                    eval_roc_auc(y_bool, (-q).detach().cpu())
+                )
+                rho = max(1, int(0.05 * n))
+                top_q = torch.topk(q, rho).indices.cpu()
+                stats["top5pct_weight_anomaly_rate"] = float(y_bool[top_q].float().mean())
+            except Exception:
+                pass
         return pi, q, stats
+
+    def _freeze_ae_eval(self):
+        """AE must stay in eval (no dropout) while building fixed latents / weights."""
+        if self.ae is None:
+            return
+        self.ae.eval()
+        for param in self.ae.parameters():
+            param.requires_grad_(False)
+
+    def _cache_center_latents(self, data):
+        """Compute z,h,r once under AE.eval() for paired free/dom training."""
+        self._freeze_ae_eval()
+        x = data.x.cuda().to(torch.float32)
+        edge_index = data.edge_index.cuda()
+        with torch.no_grad():
+            z, h, r_final = self._build_z(x, edge_index)
+            z = self._normalize_clip(z)
+        self._cached_center_latents = {
+            "z": z.detach(),
+            "h": h.detach(),
+            "r": r_final.detach(),
+            "edge_index": edge_index,
+            "x": x,
+        }
+        return self._cached_center_latents
 
     def _train_dom_weighted_fm(
         self,
@@ -305,8 +355,11 @@ class ResFlowGAD(BaseTransform):
         ae_path: str,
         model: FlowMatchingModel,
         ckpt_name: str = "dm_dom.pt",
+        z_cached: Optional[torch.Tensor] = None,
+        pi_cached: Optional[torch.Tensor] = None,
+        stats_cached: Optional[dict] = None,
     ):
-        """Train dominant-mode flow with center-consistent sample weights."""
+        """Train dominant-mode flow with a FIXED π (built once before training)."""
         ckpt = os.path.join(ae_path, ckpt_name)
         if os.environ.get("FMGAD_REUSE_CHECKPOINTS", "0") == "1" and os.path.exists(ckpt):
             if self.verbose:
@@ -318,26 +371,44 @@ class ResFlowGAD(BaseTransform):
                 f"(κ={self.dom_kappa_q}, τ={self.dom_tau_q}) ..."
             )
 
+        self._freeze_ae_eval()
+        if z_cached is None or pi_cached is None or stats_cached is None:
+            cache = self._cached_center_latents or self._cache_center_latents(data)
+            z = cache["z"]
+            y = getattr(data, "y", None)
+            pi, _q, stats = self._center_consistency_weights(cache["h"], y=y)
+        else:
+            z = z_cached
+            pi = pi_cached
+            stats = dict(stats_cached)
+
+        # Re-seed so free→dom RNG pairing is identical across weight modes
+        # (shuffled must not consume the global RNG for its permutation).
+        dom_fm_seed = int(self.dom_control_seed) + 17
+        torch.manual_seed(dom_fm_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(dom_fm_seed)
+
+        if self.verbose:
+            print(
+                f"  dom weights fixed: feat={stats.get('feat_used')} "
+                f"valid={stats.get('center_valid')} "
+                f"N_eff/N={stats.get('n_eff_ratio'):.3f} "
+                f"s_std={stats.get('s_std', float('nan')):.4g}",
+                flush=True,
+            )
+
         fm_lr = self.lr * 0.5
-        params = list(model.parameters())  # gate already trained with free flow
+        params = list(model.parameters())
         optimizer = torch.optim.Adam(params, lr=fm_lr, weight_decay=self.wd)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
         best_loss = float("inf")
         patience = 0
-        last_stats = None
+        graph_context = torch.zeros(1, z.shape[1], device=z.device)
 
         for epoch in range(self.diff_epochs):
-            x = data.x.cuda().to(torch.float32)
-            edge_index = data.edge_index.cuda()
-            z, h, r_final = self._build_z(x, edge_index)
-            z = self._normalize_clip(z)
             if torch.isnan(z).any() or torch.isinf(z).any():
                 continue
-            pi, _q, stats = self._center_consistency_weights(
-                h.detach(), feats=z.detach(), residual=r_final.detach()
-            )
-            last_stats = stats
-            graph_context = torch.zeros(1, z.shape[1], device=z.device)
             loss = flow_matching_loss(
                 model.velocity_fn, z, graph_context, reduction="mean", weight=pi
             )
@@ -372,16 +443,16 @@ class ResFlowGAD(BaseTransform):
                     if self.verbose:
                         print("FM-dom early stopping")
                     break
-        if last_stats is not None:
-            self._last_n_eff = float(last_stats["n_eff"])
-            self._last_n_eff_ratio = float(last_stats["n_eff_ratio"])
-            self._last_dom_weight_stats = last_stats
+
+        self._last_n_eff = float(stats["n_eff"])
+        self._last_n_eff_ratio = float(stats["n_eff_ratio"])
+        self._last_dom_weight_stats = stats
         if not os.path.exists(ckpt):
             torch.save(
                 {
                     "state_dict": model.state_dict(),
                     "gate_state": self.gate_module.state_dict(),
-                    "dom_weight_stats": last_stats,
+                    "dom_weight_stats": stats,
                 },
                 ckpt,
             )
@@ -394,6 +465,8 @@ class ResFlowGAD(BaseTransform):
         ckpt_name: str,
         latent_kind: str = "full",
         also_train_gate: bool = True,
+        z_cached: Optional[torch.Tensor] = None,
+        z_ref_cached: Optional[torch.Tensor] = None,
     ):
         """Train an unconditional FM on full or residual-suppressed latents."""
         ckpt = os.path.join(ae_path, ckpt_name)
@@ -413,12 +486,20 @@ class ResFlowGAD(BaseTransform):
         best_loss = float("inf")
         patience = 0
 
+        # If latents are pre-cached (center_dom), keep AE frozen and reuse fixed z.
+        use_cache = z_cached is not None
+
         for epoch in range(self.diff_epochs):
-            x = data.x.cuda().to(torch.float32)
-            edge_index = data.edge_index.cuda()
-            z_full, z_ref, _, _ = self._build_z_pair(x, edge_index)
-            z = z_full if latent_kind == "full" else z_ref
-            z = self._normalize_clip(z)
+            if use_cache:
+                z = z_cached if latent_kind == "full" else z_ref_cached
+                if z is None:
+                    raise ValueError(f"Missing cached latent for latent_kind={latent_kind}")
+            else:
+                x = data.x.cuda().to(torch.float32)
+                edge_index = data.edge_index.cuda()
+                z_full, z_ref, _, _ = self._build_z_pair(x, edge_index)
+                z = z_full if latent_kind == "full" else z_ref
+                z = self._normalize_clip(z)
             if torch.isnan(z).any() or torch.isinf(z).any():
                 continue
             graph_context = torch.zeros(1, z.shape[1], device=z.device)
@@ -560,16 +641,32 @@ class ResFlowGAD(BaseTransform):
                 self.gate_module.load_state_dict(state["gate_state"])
             return self.sample(None, self.dm, data)
 
-        # center_dom: free (uniform) + dominant (center-weighted) on full latent
+        # center_dom: free (uniform) + dominant (fixed center weights) on full latent
         if mode == "center_dom":
-            self._train_uncond_fm(data, ae_path, self.dm, "dm_free.pt", latent_kind="full")
+            self._freeze_ae_eval()
+            cache = self._cache_center_latents(data)
+            z = cache["z"]
+            y = getattr(data, "y", None)
+            with torch.no_grad():
+                pi, q, stats = self._center_consistency_weights(cache["h"], y=y)
+            self._train_uncond_fm(
+                data, ae_path, self.dm, "dm_free.pt", latent_kind="full", z_cached=z
+            )
             state = torch.load(os.path.join(ae_path, "dm_free.pt"))
             self.dm.load_state_dict(state["state_dict"])
             if "gate_state" in state:
                 self.gate_module.load_state_dict(state["gate_state"])
             velocity_dom = MLPFlowMatching(d_in=z_dim, dim_t=hid, cond_dim=None).cuda()
             self.dm_ref = FlowMatchingModel(velocity_fn=velocity_dom, hid_dim=z_dim).cuda()
-            self._train_dom_weighted_fm(data, ae_path, self.dm_ref, "dm_dom.pt")
+            self._train_dom_weighted_fm(
+                data,
+                ae_path,
+                self.dm_ref,
+                "dm_dom.pt",
+                z_cached=z,
+                pi_cached=pi,
+                stats_cached=stats,
+            )
             state_dom = torch.load(os.path.join(ae_path, "dm_dom.pt"))
             self.dm_ref.load_state_dict(state_dom["state_dict"])
             if state_dom.get("dom_weight_stats"):
@@ -712,6 +809,8 @@ class ResFlowGAD(BaseTransform):
             print(f"loading AE checkpoint: {ae_ckpt:04d}")
         ae_dict = torch.load(os.path.join(ae_path, f"{ae_ckpt}.pt"))
         self.ae.load_state_dict(ae_dict["state_dict"])
+        # Freeze AE: dropout must be off when building fixed latents / center weights.
+        self._freeze_ae_eval()
         self.gate_module = self.gate_module.to(next(self.ae.parameters()).device)
 
         # 2) trials

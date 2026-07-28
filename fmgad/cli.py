@@ -123,6 +123,8 @@ def main():
         dom_weight_mode=str(cfg.get("dom_weight_mode", "learned")),
         dom_kappa_q=float(cfg.get("dom_kappa_q", 0.5)),
         dom_tau_q=float(cfg.get("dom_tau_q", 0.2)),
+        dom_control_seed=int(cfg.get("dom_control_seed", 2027)),
+        allow_center_fallback=bool(cfg.get("allow_center_fallback", False)),
     )
 
     print("Running on dataset:", dset, "num_trial:", model.num_trial, flush=True)

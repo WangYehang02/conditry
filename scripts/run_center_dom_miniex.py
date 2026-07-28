@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Minimal center-dom dual-flow experiment (books / disney only).
+"""Strict center-dom dual-flow control (books / disney).
 
-Four weight modes for the dominant flow:
-  uniform  — q_i = 1
-  learned  — center-consistent q_i = sg[σ((R(s)_i - κ)/τ)]
-  shuffled — permute learned q
-  reversed — 1 - q
+Fixes vs previous miniex:
+  - AE.eval() + freeze after load; latents cached once
+  - center weights use cos(h, c) only (no residual fallback)
+  - shuffled: fixed one-time permutation via independent Generator
+  - polarity_enabled=False (report pre-polarity AUROC; smoothing kept)
+  - per-seed config filenames (avoid concurrent YAML clobber)
 
-Target: learned > uniform, shuffled, reversed.
-Also reports N_eff = (Σq)^2 / Σq^2.
+Modes: uniform | learned | shuffled | reversed
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from copy import deepcopy
 from pathlib import Path
 from queue import Queue
 from typing import Any, Dict, List, Tuple
@@ -33,7 +32,6 @@ DATASETS = ("books", "disney")
 SEEDS = (0, 1, 2, 3, 42)
 MODES = ("uniform", "learned", "shuffled", "reversed")
 GUIDANCE_WEIGHT = 1.25
-# Aim for ~0.3N–0.8N effective sample size
 KAPPA_Q = 0.5
 TAU_Q = 0.2
 
@@ -41,7 +39,8 @@ TAU_Q = 0.2
 def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Dict[str, Any]:
     result_path = out_root / "results" / mode / f"{dataset}_seed{seed}.json"
     log_path = out_root / "logs" / mode / f"{dataset}_seed{seed}.log"
-    cfg_path = out_root / "configs" / mode / f"{dataset}.yaml"
+    # Per-seed config path avoids concurrent writers clobbering the same YAML.
+    cfg_path = out_root / "configs" / mode / f"{dataset}_seed{seed}.yaml"
     result_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,6 +49,7 @@ def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Di
     if result_path.exists():
         try:
             payload = json.load(open(result_path))
+            stats = payload.get("dom_weight_stats") or {}
             row.update(
                 {
                     "returncode": 0,
@@ -57,13 +57,17 @@ def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Di
                     "ap": float(payload.get("ap_mean", payload.get("ap", float("nan")))),
                     "n_eff": float(payload.get("n_eff", float("nan"))),
                     "n_eff_ratio": float(payload.get("n_eff_ratio", float("nan"))),
+                    "center_valid": stats.get("center_valid"),
+                    "feat_used": stats.get("feat_used"),
+                    "s_std": stats.get("s_std"),
                     "elapsed_sec": 0.0,
                     "cached": True,
                 }
             )
             print(
                 f"[{mode}] {dataset} s{seed} cached auc={row['auc']:.4f} "
-                f"N_eff_ratio={row['n_eff_ratio']:.3f}",
+                f"N_eff_ratio={row['n_eff_ratio']:.3f} feat={row['feat_used']} "
+                f"valid={row['center_valid']}",
                 flush=True,
             )
             return row
@@ -78,12 +82,16 @@ def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Di
             "dom_weight_mode": mode,
             "dom_kappa_q": KAPPA_Q,
             "dom_tau_q": TAU_Q,
+            "dom_control_seed": int(seed) + 100003,
+            "allow_center_fallback": False,
             "use_proto": False,
             "use_proto_normal_weight": False,
             "weight": GUIDANCE_WEIGHT,
             "sample_steps": 1,
             "num_trial": 1,
-            "exp_tag": f"center_dom_{mode}_{dataset}",
+            # Isolate dominant-weighting effect from polarity correction.
+            "polarity_enabled": False,
+            "exp_tag": f"center_dom_strict_{mode}_{dataset}",
         }
     )
     with open(cfg_path, "w") as f:
@@ -117,18 +125,27 @@ def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Di
     row["cached"] = False
     if rc == 0 and result_path.exists():
         payload = json.load(open(result_path))
+        stats = payload.get("dom_weight_stats") or {}
         row["auc"] = float(payload.get("auc_mean", payload.get("auc", float("nan"))))
         row["ap"] = float(payload.get("ap_mean", payload.get("ap", float("nan"))))
         row["n_eff"] = float(payload.get("n_eff", float("nan")))
         row["n_eff_ratio"] = float(payload.get("n_eff_ratio", float("nan")))
+        row["center_valid"] = stats.get("center_valid")
+        row["feat_used"] = stats.get("feat_used")
+        row["s_std"] = stats.get("s_std")
     else:
         row["auc"] = float("nan")
         row["ap"] = float("nan")
         row["n_eff"] = float("nan")
         row["n_eff_ratio"] = float("nan")
+        row["center_valid"] = None
+        row["feat_used"] = None
+        row["s_std"] = None
     print(
         f"[{mode}] {dataset} s{seed} gpu={gpu} rc={rc} "
-        f"auc={row['auc']:.4f} N_eff_ratio={row['n_eff_ratio']:.3f} {elapsed:.0f}s",
+        f"auc={row['auc']:.4f} N_eff_ratio={row.get('n_eff_ratio', float('nan')):.3f} "
+        f"feat={row.get('feat_used')} valid={row.get('center_valid')} "
+        f"s_std={row.get('s_std')} {elapsed:.0f}s",
         flush=True,
     )
     return row
@@ -136,20 +153,24 @@ def _run_one(mode: str, dataset: str, seed: int, gpu: int, out_root: Path) -> Di
 
 def _aggregate(out_root: Path) -> None:
     lines = [
-        "# Center-dom minimal experiment (books / disney)",
+        "# Strict center-dom controls (books / disney)",
         "",
-        f"Guidance `w={GUIDANCE_WEIGHT}`, `κ_q={KAPPA_Q}`, `τ_q={TAU_Q}`. "
-        f"Seeds `{list(SEEDS)}`.",
+        f"Guidance `w={GUIDANCE_WEIGHT}`, `κ_q={KAPPA_Q}`, `τ_q={TAU_Q}`. Seeds `{list(SEEDS)}`.",
         "",
-        "Inference: `v = v_free + w(v_free - v_dom)`.",
+        "Protocol: AE frozen eval; latents+π cached once; no residual fallback; "
+        "`polarity_enabled=False`; shuffled = one fixed permutation.",
         "",
-        "| Mode | Books AUROC | Disney AUROC | Books N_eff/N | Disney N_eff/N |",
-        "|---|---:|---:|---:|---:|",
+        "Metric: **pre-polarity AUROC** (score smoothing from yaml kept).",
+        "",
+        "| Mode | Books AUROC | Disney AUROC | Books N_eff/N | Disney N_eff/N | center_valid |",
+        "|---|---:|---:|---:|---:|---|",
     ]
     summary: Dict[str, Any] = {}
     for mode in MODES:
         cells = []
         neff_cells = []
+        valid_flags = []
+        feats = []
         per = {}
         for ds in DATASETS:
             aucs, ratios = [], []
@@ -160,45 +181,64 @@ def _aggregate(out_root: Path) -> None:
                 d = json.load(open(p))
                 aucs.append(float(d.get("auc_mean", d.get("auc"))))
                 ratios.append(float(d.get("n_eff_ratio", float("nan"))))
+                st = d.get("dom_weight_stats") or {}
+                valid_flags.append(st.get("center_valid"))
+                feats.append(st.get("feat_used"))
             if len(aucs) == len(SEEDS):
                 m, s = float(np.mean(aucs)), float(np.std(aucs, ddof=1))
                 cells.append(f"{m:.4f}±{s:.4f}")
                 rr = [x for x in ratios if np.isfinite(x)]
                 neff_cells.append(f"{float(np.mean(rr)):.3f}" if rr else "nan")
-                per[ds] = {"auc_mean": m, "auc_std": s, "n_eff_ratio_mean": float(np.mean(rr)) if rr else None}
+                per[ds] = {
+                    "auc_mean": m,
+                    "auc_std": s,
+                    "n_eff_ratio_mean": float(np.mean(rr)) if rr else None,
+                }
             else:
                 cells.append(f"nan({len(aucs)}/5)")
                 neff_cells.append("nan")
                 per[ds] = {"n": len(aucs)}
+        # center_valid summary: ignore uniform's trivial True/None
+        if mode == "uniform":
+            vstr = "n/a"
+        else:
+            bools = [x for x in valid_flags if x is not None]
+            if not bools:
+                vstr = "unknown"
+            elif all(bools):
+                vstr = "yes"
+            elif not any(bools):
+                vstr = "NO (collapsed)"
+            else:
+                vstr = f"mixed ({sum(bools)}/{len(bools)})"
         lines.append(
-            f"| {mode} | {cells[0]} | {cells[1]} | {neff_cells[0]} | {neff_cells[1]} |"
+            f"| {mode} | {cells[0]} | {cells[1]} | {neff_cells[0]} | {neff_cells[1]} | {vstr} |"
         )
-        summary[mode] = per
+        summary[mode] = {"per_dataset": per, "center_valid": vstr, "feat_used_samples": feats[:4]}
 
-    # Pass/fail checklist vs hypothesis
     lines += ["", "## Hypothesis check (learned > others)", ""]
     for ds in DATASETS:
-        learned = summary.get("learned", {}).get(ds, {}).get("auc_mean")
+        learned = summary.get("learned", {}).get("per_dataset", {}).get(ds, {}).get("auc_mean")
         if learned is None:
             lines.append(f"- **{ds}**: incomplete")
             continue
         bits = []
         for other in ("uniform", "shuffled", "reversed"):
-            o = summary.get(other, {}).get(ds, {}).get("auc_mean")
+            o = summary.get(other, {}).get("per_dataset", {}).get(ds, {}).get("auc_mean")
             if o is None:
                 bits.append(f"vs {other}=incomplete")
             else:
                 ok = learned > o
-                bits.append(f"vs {other}: {'PASS' if ok else 'FAIL'} (Δ={learned-o:+.4f})")
+                bits.append(f"vs {other}: {'PASS' if ok else 'FAIL'} (Δ={learned - o:+.4f})")
         lines.append(f"- **{ds}**: " + "; ".join(bits))
 
     lines += [
         "",
-        "## N_eff diagnostic",
+        "## Notes",
         "",
-        "- Target band: `0.3 ≲ N_eff/N ≲ 0.8`",
-        "- `≈1`: weights too flat (both flows similar)",
-        "- `≪0.3`: too sharp (overfit risk on small graphs)",
+        "- If `center_valid=NO`, cosine(h,c) collapsed → weights fell back to uniform "
+        "and the center-consistency hypothesis is **not tested** on that run.",
+        "- `N_eff/N≈0.76` mainly reflects κ,τ rank-sigmoid sharpness, not center quality.",
         "",
     ]
 
@@ -211,9 +251,9 @@ def _aggregate(out_root: Path) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--gpus", type=str, default="0,2")
-    ap.add_argument("--max-workers", type=int, default=2)
-    ap.add_argument("--output-dir", type=str, default="results/center_dom_miniex")
+    ap.add_argument("--gpus", type=str, default="0,2,7")
+    ap.add_argument("--max-workers", type=int, default=3)
+    ap.add_argument("--output-dir", type=str, default="results/center_dom_strict")
     ap.add_argument("--datasets", type=str, default=",".join(DATASETS))
     ap.add_argument("--seeds", type=str, default=",".join(str(s) for s in SEEDS))
     ap.add_argument("--modes", type=str, default=",".join(MODES))
