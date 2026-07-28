@@ -41,16 +41,16 @@ def flow_matching_loss(model, x_1, graph_context, reduction='mean', weight=None)
 
     mse_per_sample = F.mse_loss(pred_v, target_v, reduction='none').mean(dim=1)
 
-    if weight is not None:
-        mse_per_sample = mse_per_sample * weight
-
-    # reduction
-    if reduction == 'mean':
-        return mse_per_sample.mean()
-    elif reduction == 'none':
+    if reduction == 'none':
+        if weight is not None:
+            return mse_per_sample * weight.reshape(-1)
         return mse_per_sample
-    else:
-        raise ValueError(f"Unknown reduction: {reduction}")
+    if reduction == 'mean':
+        if weight is not None:
+            w = weight.reshape(-1).to(dtype=mse_per_sample.dtype)
+            return (mse_per_sample * w).sum() / w.sum().clamp_min(1e-8)
+        return mse_per_sample.mean()
+    raise ValueError(f"Unknown reduction: {reduction}")
 
 
 def conditional_flow_matching_loss(model, x_1, graph_context, t_sampling='uniform',
@@ -95,12 +95,14 @@ def conditional_flow_matching_loss(model, x_1, graph_context, t_sampling='unifor
 
     mse_per_sample = F.mse_loss(pred_v, target_v, reduction='none').mean(dim=1)
 
-    if weight is not None:
-        mse_per_sample = mse_per_sample * weight
-
-    if reduction == 'mean':
-        return mse_per_sample.mean()
-    elif reduction == 'none':
+    if reduction == 'none':
+        if weight is not None:
+            return mse_per_sample * weight.reshape(-1)
         return mse_per_sample
-    else:
-        raise ValueError(f"Unknown reduction: {reduction}")
+    if reduction == 'mean':
+        if weight is not None:
+            # L_normal = sum_i q_i * ell_i / sum_i q_i
+            w = weight.reshape(-1).to(dtype=mse_per_sample.dtype)
+            return (mse_per_sample * w).sum() / w.sum().clamp_min(1e-8)
+        return mse_per_sample.mean()
+    raise ValueError(f"Unknown reduction: {reduction}")

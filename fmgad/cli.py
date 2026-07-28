@@ -116,6 +116,13 @@ def main():
         polarity_consensus_threshold=float(cfg.get("polarity_consensus_threshold", 0.70)),
         polarity_consensus_score_weight=float(cfg.get("polarity_consensus_score_weight", 0.90)),
         generative_backend=str(cfg.get("generative_backend", "flow")),
+        proto_normal_temp=float(cfg.get("proto_normal_temp", 50.0)),
+        use_proto_normal_weight=bool(cfg.get("use_proto_normal_weight", False)),
+        dual_flow_mode=cfg.get("dual_flow_mode", None),
+        flow_hidden_dim=int(cfg.get("flow_hidden_dim", 512)),
+        dom_weight_mode=str(cfg.get("dom_weight_mode", "learned")),
+        dom_kappa_q=float(cfg.get("dom_kappa_q", 0.5)),
+        dom_tau_q=float(cfg.get("dom_tau_q", 0.2)),
     )
 
     print("Running on dataset:", dset, "num_trial:", model.num_trial, flush=True)

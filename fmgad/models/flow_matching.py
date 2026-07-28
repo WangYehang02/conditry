@@ -137,6 +137,54 @@ class MLPFlowMatching(nn.Module):
         return v_t
 
 
+class MLPFlowMatchingTwoHead(nn.Module):
+    """Shared trunk with two velocity heads (full vs reference)."""
+
+    def __init__(self, d_in, dim_t=512):
+        super().__init__()
+        self.dim_t = dim_t
+        self.map_time = PositionalEmbedding(num_channels=dim_t)
+        self.time_embed = nn.Sequential(
+            nn.Linear(dim_t, dim_t),
+            nn.SiLU(),
+            nn.Linear(dim_t, dim_t),
+        )
+        self.proj_x = nn.Linear(d_in, dim_t)
+        self.trunk = nn.Sequential(
+            nn.Linear(dim_t, dim_t * 2),
+            nn.SiLU(),
+            nn.Linear(dim_t * 2, dim_t * 2),
+            nn.SiLU(),
+            nn.Linear(dim_t * 2, dim_t),
+            nn.SiLU(),
+        )
+        self.head_full = nn.Linear(dim_t, d_in)
+        self.head_ref = nn.Linear(dim_t, d_in)
+
+    def _embed(self, x, t):
+        if isinstance(t, (int, float)):
+            t = torch.tensor([t], device=x.device, dtype=x.dtype).expand(x.shape[0])
+        elif t.dim() == 0:
+            t = t.unsqueeze(0).expand(x.shape[0])
+        elif t.dim() > 1:
+            t = t.squeeze(-1) if t.shape[-1] == 1 else t.flatten()
+        t = t.clamp(0.0, 1.0)
+        t_emb = self.map_time(t * 1000.0)
+        t_emb = t_emb.reshape(t_emb.shape[0], 2, -1).flip(1).reshape(*t_emb.shape)
+        t_emb = self.time_embed(t_emb)
+        return self.trunk(self.proj_x(x) + t_emb)
+
+    def forward(self, x, t, which: str = "full", context=None, proto_alpha=None):
+        h = self._embed(x, t)
+        if which == "ref":
+            return self.head_ref(h)
+        return self.head_full(h)
+
+    def forward_both(self, x, t):
+        h = self._embed(x, t)
+        return self.head_full(h), self.head_ref(h)
+
+
 class PositionalEmbedding(torch.nn.Module):
     def __init__(self, num_channels, max_positions=10000, endpoint=False):
         super().__init__()
@@ -152,6 +200,41 @@ class PositionalEmbedding(torch.nn.Module):
         x = x.ger(freqs.to(x.dtype))
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
+
+
+def sample_flow_matching_pair(
+    full_net,
+    ref_net,
+    x_0,
+    num_steps=50,
+    weight=1.0,
+    shared_two_head: bool = False,
+):
+    """Euler sample with residual-contrastive / dual-flow guidance.
+
+    v = (1+w) * v_full - w * v_ref
+    """
+    device = x_0.device
+    batch_size = x_0.shape[0]
+    dt = 1.0 / num_steps
+    x_t = x_0.clone()
+    if hasattr(full_net, "eval"):
+        full_net.eval()
+    if ref_net is not None and hasattr(ref_net, "eval"):
+        ref_net.eval()
+
+    with torch.no_grad():
+        for i in range(num_steps):
+            t = torch.full((batch_size,), i * dt, device=device, dtype=x_0.dtype)
+            if shared_two_head:
+                v_full, v_ref = full_net.forward_both(x_t, t)
+            else:
+                v_full = full_net(x_t, t, context=None, proto_alpha=None)
+                v_ref = ref_net(x_t, t, context=None, proto_alpha=None)
+            w = 0.0 if weight is None else float(weight)
+            v_combined = (1.0 + w) * v_full - w * v_ref
+            x_t = x_t + dt * v_combined
+    return x_t
 
 
 class FlowMatchingModel(nn.Module):
@@ -243,7 +326,16 @@ def sample_flow_matching(velocity_net, x_0, num_steps=50, proto=None, proto_alph
     return x_t
 
 
-def sample_flow_matching_free(proto_net, free_net, x_0, num_steps=50, proto=None, proto_alpha=None, weight=None):
+def sample_flow_matching_free(
+    proto_net,
+    free_net,
+    x_0,
+    num_steps=50,
+    proto=None,
+    proto_alpha=None,
+    weight=None,
+    return_gap: bool = False,
+):
     """
     Combine prototype-conditioned and free velocity nets during Euler sampling.
 
@@ -252,11 +344,13 @@ def sample_flow_matching_free(proto_net, free_net, x_0, num_steps=50, proto=None
         free_net: unconditional velocity
         x_0: initial noise [batch, dim]
         num_steps: Euler steps
-        proto: prototype tensor
+        proto: prototype tensor [1, d] or per-node [batch, d]
         proto_alpha: prototype strength
         weight: blend weight; larger weight pushes toward the proto branch
+        return_gap: if True, also return mean ||v_free - v_proto||_2
     Returns:
         x_1: generated state [batch, dim]
+        (optional) guidance_gap: scalar float
     """
     device = x_0.device
     batch_size = x_0.shape[0]
@@ -267,6 +361,7 @@ def sample_flow_matching_free(proto_net, free_net, x_0, num_steps=50, proto=None
     proto_net.eval()
     free_net.eval()
 
+    gap_vals = []
     with torch.no_grad():
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=device, dtype=x_0.dtype)
@@ -274,8 +369,14 @@ def sample_flow_matching_free(proto_net, free_net, x_0, num_steps=50, proto=None
             v_proto = proto_net(x_t, t, context=proto, proto_alpha=proto_alpha)
             v_free = free_net(x_t, t, context=None, proto_alpha=None)
 
+            if return_gap:
+                gap_vals.append(torch.mean(torch.norm(v_free - v_proto, dim=1)))
+
             v_combined = (1.0 + weight) * v_free - weight * v_proto
 
             x_t = x_t + dt * v_combined
 
+    if return_gap:
+        gap = float(torch.stack(gap_vals).mean()) if gap_vals else float("nan")
+        return x_t, gap
     return x_t

@@ -5,8 +5,10 @@ from fmgad.models.diffusion import DiffusionModel, MLPDiffusion, sample_dm
 from fmgad.models.flow_matching import (
     FlowMatchingModel,
     MLPFlowMatching,
+    MLPFlowMatchingTwoHead,
     sample_flow_matching,
     sample_flow_matching_free,
+    sample_flow_matching_pair,
 )
 
 __all__ = [
@@ -15,7 +17,9 @@ __all__ = [
     "GraphAE",
     "MLPDiffusion",
     "MLPFlowMatching",
+    "MLPFlowMatchingTwoHead",
     "sample_dm",
     "sample_flow_matching",
     "sample_flow_matching_free",
+    "sample_flow_matching_pair",
 ]
